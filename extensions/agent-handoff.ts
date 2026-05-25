@@ -1,3 +1,5 @@
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -34,6 +36,22 @@ type HandoffRecord = {
 };
 
 type HandoffStore = { handoffs: HandoffRecord[] };
+
+type ActiveJob = {
+	id: string;
+	agentId: string;
+	status: string;
+	action: string;
+	task: string;
+	startedAt: number;
+	updatedAt: number;
+	childSession?: string;
+};
+
+const activeJobs = new Map<string, ActiveJob>();
+const cleanupTimers = new Map<string, NodeJS.Timeout>();
+
+const execFileAsync = promisify(execFile);
 
 const DEFAULT_SYSTEM_PROMPT = `You are a focused specialist subagent. Complete only the delegated task. Be concise, concrete, and return findings or completed work clearly.`;
 
@@ -125,15 +143,49 @@ function extractAssistantText(messages: any[]): string {
 	return "Subagent completed without a final text response.";
 }
 
-function renderSubagentWidget(agentId: string, status: string, events: string[]): string[] {
-	const recent = events.slice(-8);
-	return [`Subagent ${agentId}: ${status}`, ...recent.map((event) => `  ${event}`)];
+function renderActiveJobs(): string[] {
+	const jobs = [...activeJobs.values()].sort((a, b) => a.startedAt - b.startedAt);
+	if (jobs.length === 0) return [];
+	const visible = jobs.slice(0, 5).map((job) => {
+		const ageSeconds = Math.max(0, Math.floor((Date.now() - job.startedAt) / 1000));
+		return `● ${job.agentId} ${job.status}: ${truncateToWidth(job.action, 70)} (${ageSeconds}s)`;
+	});
+	if (jobs.length > visible.length) visible.push(`… +${jobs.length - visible.length} more subagents`);
+	return [`Subagents (${jobs.length})`, ...visible];
 }
 
-function appendProgress(ctx: any, agentId: string, status: string, events: string[], event: string) {
+function refreshActiveJobsWidget(ctx: any) {
+	const lines = renderActiveJobs();
+	ctx.ui.setWidget("agent-handoff-active", lines.length ? lines : undefined, { placement: "belowEditor" });
+	ctx.ui.setStatus("agent-handoff-active", lines.length ? `subagents: ${activeJobs.size}` : undefined);
+}
+
+function updateJob(ctx: any, jobId: string, status: string, action: string) {
+	const job = activeJobs.get(jobId);
+	if (!job) return;
+	job.status = status;
+	job.action = action;
+	job.updatedAt = Date.now();
+	refreshActiveJobsWidget(ctx);
+}
+
+function finishJob(ctx: any, jobId: string, status: "done" | "error", action: string) {
+	updateJob(ctx, jobId, status, action);
+	const existing = cleanupTimers.get(jobId);
+	if (existing) clearTimeout(existing);
+	cleanupTimers.set(
+		jobId,
+		setTimeout(() => {
+			activeJobs.delete(jobId);
+			cleanupTimers.delete(jobId);
+			refreshActiveJobsWidget(ctx);
+		}, 15_000),
+	);
+}
+
+function appendProgress(ctx: any, jobId: string, _agentId: string, status: string, events: string[], event: string) {
 	events.push(event);
-	ctx.ui.setStatus("agent-handoff", `subagent ${agentId}: ${status}`);
-	ctx.ui.setWidget("agent-handoff", renderSubagentWidget(agentId, status, events), { placement: "belowEditor" });
+	updateJob(ctx, jobId, status, event);
 }
 
 function compactJson(value: unknown, maxLength = 160): string {
@@ -164,7 +216,17 @@ async function runSubagent(ctx: any, agent: AgentProfile, prompt: string, task: 
 		updatedAt: now,
 	};
 	saveHandoff(ctx.cwd, record);
-	appendProgress(ctx, agent.id, "starting", progressEvents, "starting child session");
+	activeJobs.set(record.id, {
+		id: record.id,
+		agentId: agent.id,
+		status: "starting",
+		action: "starting child session",
+		task,
+		startedAt: Date.now(),
+		updatedAt: Date.now(),
+	});
+	refreshActiveJobsWidget(ctx);
+	appendProgress(ctx, record.id, agent.id, "starting", progressEvents, "starting child session");
 
 	const loader = new DefaultResourceLoader({
 		cwd: ctx.cwd,
@@ -189,37 +251,40 @@ async function runSubagent(ctx: any, agent: AgentProfile, prompt: string, task: 
 		modelRegistry: ctx.modelRegistry,
 	});
 	record.childSession = session.sessionFile;
+	const activeJob = activeJobs.get(record.id);
+	if (activeJob) activeJob.childSession = session.sessionFile;
 	record.updatedAt = new Date().toISOString();
 	saveHandoff(ctx.cwd, record);
 
 	const unsubscribe = session.subscribe((event: any) => {
 		if (event.type === "agent_start") {
-			appendProgress(ctx, agent.id, "running", progressEvents, "agent started");
+			appendProgress(ctx, record.id, agent.id, "running", progressEvents, "agent started");
 		} else if (event.type === "turn_start") {
-			appendProgress(ctx, agent.id, "thinking", progressEvents, "thinking / planning next step");
+			appendProgress(ctx, record.id, agent.id, "thinking", progressEvents, "thinking / planning next step");
 		} else if (event.type === "tool_execution_start") {
 			const args = compactJson(event.args);
-			appendProgress(ctx, agent.id, "tool", progressEvents, `tool started: ${event.toolName ?? "unknown"}${args ? ` ${args}` : ""}`);
+			appendProgress(ctx, record.id, agent.id, "tool", progressEvents, `tool started: ${event.toolName ?? "unknown"}${args ? ` ${args}` : ""}`);
 		} else if (event.type === "tool_execution_update") {
 			const partial = compactJson(event.partialResult, 120);
-			if (partial) appendProgress(ctx, agent.id, "tool", progressEvents, `tool update: ${event.toolName ?? "unknown"} ${partial}`);
+			if (partial) appendProgress(ctx, record.id, agent.id, "tool", progressEvents, `tool update: ${event.toolName ?? "unknown"} ${partial}`);
 		} else if (event.type === "tool_execution_end") {
 			const result = compactJson(event.result, 160);
-			appendProgress(ctx, agent.id, "running", progressEvents, `tool finished: ${event.toolName ?? "unknown"}${event.isError ? " (error)" : ""}${result ? ` ${result}` : ""}`);
+			appendProgress(ctx, record.id, agent.id, "running", progressEvents, `tool finished: ${event.toolName ?? "unknown"}${event.isError ? " (error)" : ""}${result ? ` ${result}` : ""}`);
 		} else if (event.type === "message_update" && event.assistantMessageEvent?.type === "thinking_delta") {
 			const delta = String(event.assistantMessageEvent.delta ?? "").replace(/\s+/g, " ").trim();
-			if (delta) appendProgress(ctx, agent.id, "thinking", progressEvents, `thinking: ${delta.slice(0, 100)}`);
+			if (delta) appendProgress(ctx, record.id, agent.id, "thinking", progressEvents, `thinking: ${delta.slice(0, 100)}`);
 		} else if (event.type === "message_update" && event.assistantMessageEvent?.type === "text_delta") {
 			const delta = String(event.assistantMessageEvent.delta ?? "").replace(/\s+/g, " ").trim();
-			if (delta) appendProgress(ctx, agent.id, "responding", progressEvents, `assistant: ${delta.slice(0, 100)}`);
+			if (delta) appendProgress(ctx, record.id, agent.id, "responding", progressEvents, `assistant: ${delta.slice(0, 100)}`);
 		} else if (event.type === "agent_end") {
-			appendProgress(ctx, agent.id, "finishing", progressEvents, "agent finished");
+			appendProgress(ctx, record.id, agent.id, "finishing", progressEvents, "agent finished");
 		}
 	});
 
 	try {
 		await session.prompt(prompt);
-		appendProgress(ctx, agent.id, "completed", progressEvents, "result ready");
+		appendProgress(ctx, record.id, agent.id, "completed", progressEvents, "result ready");
+		finishJob(ctx, record.id, "done", "result ready");
 		record.status = "done";
 		record.updatedAt = new Date().toISOString();
 		saveHandoff(ctx.cwd, record);
@@ -227,14 +292,14 @@ async function runSubagent(ctx: any, agent: AgentProfile, prompt: string, task: 
 	} catch (error) {
 		record.status = "error";
 		record.error = error instanceof Error ? error.message : String(error);
+		finishJob(ctx, record.id, "error", record.error);
 		record.updatedAt = new Date().toISOString();
 		saveHandoff(ctx.cwd, record);
 		throw error;
 	} finally {
 		unsubscribe();
 		session.dispose();
-		ctx.ui.setStatus("agent-handoff", undefined);
-		ctx.ui.setWidget("agent-handoff", undefined);
+		ctx.ui.setWidget("agent-handoff-detail", undefined);
 	}
 }
 
@@ -258,6 +323,16 @@ function buildAgentsReport(cwd: string): string {
 	return `Configured agents\n=================\n\n${agentText || "No agents configured."}\n\nRecent handoffs\n===============\n\n${handoffText}`;
 }
 
+function shellQuote(value: string): string {
+	return `'${value.replace(/'/g, `'"'"'`)}'`;
+}
+
+async function openSessionInTmux(cwd: string, sessionFile: string, name: string): Promise<void> {
+	const safeName = `pi:${name.replace(/[^a-zA-Z0-9_.:-]/g, "-").slice(0, 40) || "agent"}`;
+	const command = `cd ${shellQuote(cwd)} && pi --session ${shellQuote(sessionFile)}`;
+	await execFileAsync("tmux", ["new-window", "-n", safeName, command]);
+}
+
 function getParentSession(ctx: any): string | undefined {
 	const headerParent = (ctx.sessionManager.getHeader() as any).parentSession as string | undefined;
 	if (headerParent) return headerParent;
@@ -265,6 +340,8 @@ function getParentSession(ctx: any): string | undefined {
 	if (!currentSession) return undefined;
 	return loadHandoffs(ctx.cwd).find((handoff) => handoff.childSession === currentSession)?.parentSession;
 }
+
+type DashboardAction = { action: "switch" | "tmux"; session: string; label: string };
 
 function dashboardItems(cwd: string, parentSession?: string): SelectItem[] {
 	const items: SelectItem[] = [];
@@ -307,7 +384,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			const selectedSession = await ctx.ui.custom<string | undefined>((tui, theme, _kb, done) => {
+			const selectedAction = await ctx.ui.custom<DashboardAction | undefined>((tui, theme, _kb, done) => {
 				const container = new Container();
 				const agents = loadAgents(ctx.cwd);
 				const parentSession = getParentSession(ctx);
@@ -315,11 +392,12 @@ export default function (pi: ExtensionAPI) {
 
 				container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
 				container.addChild(new Text(theme.fg("accent", theme.bold("Agent handoff dashboard")), 1, 0));
-				container.addChild(new Text(theme.fg("dim", `${agents.length} configured agents · ${items.length} persisted handoff sessions`), 1, 0));
+				container.addChild(new Text(theme.fg("dim", `${agents.length} configured agents · ${items.length} persisted handoff sessions · use /agent tmux <id> to open in tmux`), 1, 0));
 
 				if (items.length === 0) {
 					container.addChild(new Text("No persisted handoff sessions yet. Run /agent ask <agent-id> <task> first.", 1, 1));
 				} else {
+					let selectedItem = items[0];
 					const selectList = new SelectList(items, Math.min(items.length, 12), {
 						selectedPrefix: (text: string) => theme.fg("accent", text),
 						selectedText: (text: string) => theme.fg("accent", text),
@@ -327,15 +405,22 @@ export default function (pi: ExtensionAPI) {
 						scrollInfo: (text: string) => theme.fg("dim", text),
 						noMatch: (text: string) => theme.fg("warning", text),
 					});
-					selectList.onSelect = (item) => done(item.value);
+					selectList.onSelect = (item) => done({ action: "switch", session: item.value, label: item.label });
 					selectList.onCancel = () => done(undefined);
+					selectList.onSelectionChange = (item) => {
+						selectedItem = item;
+					};
 					container.addChild(selectList);
-					container.addChild(new Text(theme.fg("dim", "↑↓ navigate • enter switch to session • esc close"), 1, 0));
+					container.addChild(new Text(theme.fg("dim", "↑↓ navigate • enter switch • t open in tmux • esc close"), 1, 0));
 					container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
 					return {
 						render: (width: number) => container.render(width),
 						invalidate: () => container.invalidate(),
 						handleInput: (data: string) => {
+							if (data === "t" && selectedItem) {
+								done({ action: "tmux", session: selectedItem.value, label: selectedItem.label });
+								return;
+							}
 							selectList.handleInput?.(data);
 							tui.requestRender();
 						},
@@ -351,20 +436,30 @@ export default function (pi: ExtensionAPI) {
 				};
 			}, { overlay: true, overlayOptions: { width: "90%", maxHeight: "80%" } });
 
-			if (selectedSession) {
-				const result = await ctx.switchSession(selectedSession, {
-					withSession: async (replacementCtx) => replacementCtx.ui.notify("Switched to handoff session", "info"),
-				});
-				if (result.cancelled) ctx.ui.notify("Session switch cancelled", "info");
+			if (selectedAction) {
+				if (selectedAction.action === "tmux") {
+					try {
+						await openSessionInTmux(ctx.cwd, selectedAction.session, selectedAction.label);
+						ctx.ui.notify("Opened handoff session in tmux", "info");
+					} catch (error) {
+						const message = error instanceof Error ? error.message : String(error);
+						ctx.ui.notify(`Failed to open tmux window: ${message}`, "error");
+					}
+				} else {
+					const result = await ctx.switchSession(selectedAction.session, {
+						withSession: async (replacementCtx) => replacementCtx.ui.notify("Switched to handoff session", "info"),
+					});
+					if (result.cancelled) ctx.ui.notify("Session switch cancelled", "info");
+				}
 			}
 		},
 	});
 
 	pi.registerCommand("agent", {
-		description: "Agent handoff commands: /agent new|ask|draft <agent-id> <task>, /agent switch [handoff-id|agent-id|latest]",
+		description: "Agent handoff commands: /agent new|ask|draft <agent-id> <task>, /agent switch [handoff-id|agent-id|latest|parent], /agent tmux [handoff-id|agent-id|latest|parent]",
 		handler: async (args, ctx) => {
 			const [subcommand, ...rest] = args.trim().split(/\s+/);
-			if (subcommand === "switch") {
+			if (subcommand === "switch" || subcommand === "tmux") {
 				const selector = rest.join(" ").trim() || "latest";
 				let targetSession: string | undefined;
 				let label = "handoff";
@@ -380,6 +475,16 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify(`No session found for: ${selector}`, "error");
 					return;
 				}
+				if (subcommand === "tmux") {
+					try {
+						await openSessionInTmux(ctx.cwd, targetSession, label);
+						ctx.ui.notify(`Opened ${label} session in tmux`, "info");
+					} catch (error) {
+						const message = error instanceof Error ? error.message : String(error);
+						ctx.ui.notify(`Failed to open tmux window: ${message}`, "error");
+					}
+					return;
+				}
 				const result = await ctx.switchSession(targetSession, {
 					withSession: async (replacementCtx) => {
 						replacementCtx.ui.notify(`Switched to ${label} session`, "info");
@@ -391,7 +496,7 @@ export default function (pi: ExtensionAPI) {
 
 			const parsed = parseAgentCommand(rest.join(" "));
 			if (!subcommand || !["new", "ask", "draft"].includes(subcommand) || !parsed.agentId || !parsed.task) {
-				ctx.ui.notify("Usage: /agent new <agent-id> <task>, /agent ask <agent-id> <task>, /agent draft <agent-id> <task>, or /agent switch [handoff-id|agent-id|latest]", "error");
+				ctx.ui.notify("Usage: /agent new <agent-id> <task>, /agent ask <agent-id> <task>, /agent draft <agent-id> <task>, /agent switch [handoff-id|agent-id|latest|parent], or /agent tmux [handoff-id|agent-id|latest|parent]", "error");
 				return;
 			}
 			const agent = findAgent(ctx.cwd, parsed.agentId);
