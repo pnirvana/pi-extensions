@@ -2,7 +2,8 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { createAgentSession, DefaultResourceLoader, getAgentDir, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
+import { createAgentSession, DefaultResourceLoader, DynamicBorder, getAgentDir, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
+import { Container, type SelectItem, SelectList, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 type HandoffMode = "fire_and_forget" | "subagent";
@@ -237,6 +238,54 @@ async function runSubagent(ctx: any, agent: AgentProfile, prompt: string, task: 
 	}
 }
 
+function findHandoff(cwd: string, selector?: string): HandoffRecord | undefined {
+	const handoffs = loadHandoffs(cwd);
+	if (!selector || selector === "latest") return handoffs.find((handoff) => handoff.childSession);
+	return handoffs.find((handoff) => handoff.id === selector || handoff.id.startsWith(selector) || handoff.agentId === selector);
+}
+
+function buildAgentsReport(cwd: string): string {
+	const agents = loadAgents(cwd);
+	const handoffs = loadHandoffs(cwd).slice(0, 20);
+	const agentText = agents
+		.map((agent) => `${agent.id}: ${agent.label ?? agent.id}\n${agent.description}\nTools: ${(agent.tools ?? []).join(", ") || "default"}`)
+		.join("\n\n");
+	const handoffText = handoffs.length
+		? handoffs
+				.map((handoff) => `${handoff.status.toUpperCase()} ${handoff.agentId} ${handoff.mode}\nID: ${handoff.id}\nTask: ${handoff.task}\nSession: ${handoff.childSession ?? "pending"}\nUpdated: ${handoff.updatedAt}${handoff.error ? `\nError: ${handoff.error}` : ""}`)
+				.join("\n\n")
+		: "No handoffs recorded yet.";
+	return `Configured agents\n=================\n\n${agentText || "No agents configured."}\n\nRecent handoffs\n===============\n\n${handoffText}`;
+}
+
+function getParentSession(ctx: any): string | undefined {
+	const headerParent = (ctx.sessionManager.getHeader() as any).parentSession as string | undefined;
+	if (headerParent) return headerParent;
+	const currentSession = ctx.sessionManager.getSessionFile();
+	if (!currentSession) return undefined;
+	return loadHandoffs(ctx.cwd).find((handoff) => handoff.childSession === currentSession)?.parentSession;
+}
+
+function dashboardItems(cwd: string, parentSession?: string): SelectItem[] {
+	const items: SelectItem[] = [];
+	if (parentSession) {
+		items.push({
+			value: parentSession,
+			label: "← Parent/master session",
+			description: parentSession,
+		});
+	}
+	const handoffs = loadHandoffs(cwd).filter((handoff) => handoff.childSession).slice(0, 20);
+	items.push(
+		...handoffs.map((handoff) => ({
+			value: handoff.childSession!,
+			label: `${handoff.status.toUpperCase()} ${handoff.agentId}: ${truncateToWidth(handoff.task, 80)}`,
+			description: `${handoff.updatedAt} · ${handoff.id}`,
+		})),
+	);
+	return items;
+}
+
 function parseAgentCommand(args: string): { agentId?: string; task?: string } {
 	const trimmed = args.trim();
 	const firstSpace = trimmed.indexOf(" ");
@@ -247,33 +296,102 @@ function parseAgentCommand(args: string): { agentId?: string; task?: string } {
 
 export default function (pi: ExtensionAPI) {
 	pi.registerCommand("agents", {
-		description: "List configured handoff agents",
+		description: "Show configured handoff agents and recent handoffs",
 		handler: async (_args, ctx) => {
 			const agents = loadAgents(ctx.cwd);
 			if (agents.length === 0) {
 				ctx.ui.notify("No agents configured. Create .pi/agents.json", "warning");
+			}
+			if (!ctx.hasUI) {
+				ctx.ui.setEditorText(buildAgentsReport(ctx.cwd));
 				return;
 			}
-			const handoffs = loadHandoffs(ctx.cwd).slice(0, 20);
-			const agentText = agents
-				.map((agent) => `${agent.id}: ${agent.label ?? agent.id}\n${agent.description}\nTools: ${(agent.tools ?? []).join(", ") || "default"}`)
-				.join("\n\n");
-			const handoffText = handoffs.length
-				? handoffs
-						.map((handoff) => `${handoff.status.toUpperCase()} ${handoff.agentId} ${handoff.mode}\nTask: ${handoff.task}\nSession: ${handoff.childSession ?? "pending"}\nUpdated: ${handoff.updatedAt}${handoff.error ? `\nError: ${handoff.error}` : ""}`)
-						.join("\n\n")
-				: "No handoffs recorded yet.";
-			ctx.ui.setEditorText(`Configured agents\n=================\n\n${agentText}\n\nRecent handoffs\n===============\n\n${handoffText}`);
+
+			const selectedSession = await ctx.ui.custom<string | undefined>((tui, theme, _kb, done) => {
+				const container = new Container();
+				const agents = loadAgents(ctx.cwd);
+				const parentSession = getParentSession(ctx);
+				const items = dashboardItems(ctx.cwd, parentSession);
+
+				container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
+				container.addChild(new Text(theme.fg("accent", theme.bold("Agent handoff dashboard")), 1, 0));
+				container.addChild(new Text(theme.fg("dim", `${agents.length} configured agents · ${items.length} persisted handoff sessions`), 1, 0));
+
+				if (items.length === 0) {
+					container.addChild(new Text("No persisted handoff sessions yet. Run /agent ask <agent-id> <task> first.", 1, 1));
+				} else {
+					const selectList = new SelectList(items, Math.min(items.length, 12), {
+						selectedPrefix: (text: string) => theme.fg("accent", text),
+						selectedText: (text: string) => theme.fg("accent", text),
+						description: (text: string) => theme.fg("muted", text),
+						scrollInfo: (text: string) => theme.fg("dim", text),
+						noMatch: (text: string) => theme.fg("warning", text),
+					});
+					selectList.onSelect = (item) => done(item.value);
+					selectList.onCancel = () => done(undefined);
+					container.addChild(selectList);
+					container.addChild(new Text(theme.fg("dim", "↑↓ navigate • enter switch to session • esc close"), 1, 0));
+					container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
+					return {
+						render: (width: number) => container.render(width),
+						invalidate: () => container.invalidate(),
+						handleInput: (data: string) => {
+							selectList.handleInput?.(data);
+							tui.requestRender();
+						},
+					};
+				}
+
+				container.addChild(new Text(theme.fg("dim", "esc close"), 1, 0));
+				container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
+				return {
+					render: (width: number) => container.render(width),
+					invalidate: () => container.invalidate(),
+					handleInput: () => done(undefined),
+				};
+			}, { overlay: true, overlayOptions: { width: "90%", maxHeight: "80%" } });
+
+			if (selectedSession) {
+				const result = await ctx.switchSession(selectedSession, {
+					withSession: async (replacementCtx) => replacementCtx.ui.notify("Switched to handoff session", "info"),
+				});
+				if (result.cancelled) ctx.ui.notify("Session switch cancelled", "info");
+			}
 		},
 	});
 
 	pi.registerCommand("agent", {
-		description: "Agent handoff commands: /agent new <agent-id> <task>, /agent ask <agent-id> <task>, /agent draft <agent-id> <task>",
+		description: "Agent handoff commands: /agent new|ask|draft <agent-id> <task>, /agent switch [handoff-id|agent-id|latest]",
 		handler: async (args, ctx) => {
 			const [subcommand, ...rest] = args.trim().split(/\s+/);
+			if (subcommand === "switch") {
+				const selector = rest.join(" ").trim() || "latest";
+				let targetSession: string | undefined;
+				let label = "handoff";
+				if (selector === "parent") {
+					targetSession = getParentSession(ctx);
+					label = "parent";
+				} else {
+					const handoff = findHandoff(ctx.cwd, selector);
+					targetSession = handoff?.childSession;
+					label = handoff?.agentId ?? selector;
+				}
+				if (!targetSession) {
+					ctx.ui.notify(`No session found for: ${selector}`, "error");
+					return;
+				}
+				const result = await ctx.switchSession(targetSession, {
+					withSession: async (replacementCtx) => {
+						replacementCtx.ui.notify(`Switched to ${label} session`, "info");
+					},
+				});
+				if (result.cancelled) ctx.ui.notify("Session switch cancelled", "info");
+				return;
+			}
+
 			const parsed = parseAgentCommand(rest.join(" "));
 			if (!subcommand || !["new", "ask", "draft"].includes(subcommand) || !parsed.agentId || !parsed.task) {
-				ctx.ui.notify("Usage: /agent new <agent-id> <task>, /agent ask <agent-id> <task>, or /agent draft <agent-id> <task>", "error");
+				ctx.ui.notify("Usage: /agent new <agent-id> <task>, /agent ask <agent-id> <task>, /agent draft <agent-id> <task>, or /agent switch [handoff-id|agent-id|latest]", "error");
 				return;
 			}
 			const agent = findAgent(ctx.cwd, parsed.agentId);
