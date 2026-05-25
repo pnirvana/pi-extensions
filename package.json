@@ -1,0 +1,29 @@
+{
+  "name": "pi-agent-handoff",
+  "version": "0.1.0",
+  "description": "Agent handoff and subagent delegation extension for pi.",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "agents",
+    "handoff",
+    "subagent"
+  ],
+  "license": "MIT",
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ]
+  },
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "^0.75.5",
+    "@earendil-works/pi-ai": "^0.75.5",
+    "@earendil-works/pi-tui": "^0.75.5",
+    "typebox": "^1.1.38"
+  },
+  "devDependencies": {
+    "tsx": "^4.20.0",
+    "typescript": "^5.8.0"
+  }
+}
