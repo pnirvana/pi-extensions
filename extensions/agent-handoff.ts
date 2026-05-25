@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -18,10 +18,49 @@ type AgentProfile = {
 
 type AgentsConfig = { agents?: AgentProfile[] };
 
+type HandoffRecord = {
+	id: string;
+	agentId: string;
+	mode: HandoffMode;
+	status: "running" | "done" | "error";
+	task: string;
+	cwd: string;
+	parentSession?: string;
+	childSession?: string;
+	createdAt: string;
+	updatedAt: string;
+	error?: string;
+};
+
+type HandoffStore = { handoffs: HandoffRecord[] };
+
 const DEFAULT_SYSTEM_PROMPT = `You are a focused specialist subagent. Complete only the delegated task. Be concise, concrete, and return findings or completed work clearly.`;
 
 function configPaths(cwd: string): string[] {
 	return [join(cwd, ".pi", "agents.json"), join(cwd, "agents.json"), join(homedir(), ".pi", "agent", "agents.json")];
+}
+
+function handoffStorePath(cwd: string): string {
+	return join(cwd, ".pi", "handoffs.json");
+}
+
+function loadHandoffs(cwd: string): HandoffRecord[] {
+	const path = handoffStorePath(cwd);
+	if (!existsSync(path)) return [];
+	try {
+		const parsed = JSON.parse(readFileSync(path, "utf8")) as HandoffStore;
+		return parsed.handoffs ?? [];
+	} catch {
+		return [];
+	}
+}
+
+function saveHandoff(cwd: string, record: HandoffRecord): void {
+	const path = handoffStorePath(cwd);
+	mkdirSync(join(cwd, ".pi"), { recursive: true });
+	const handoffs = loadHandoffs(cwd).filter((item) => item.id !== record.id);
+	handoffs.unshift(record);
+	writeFileSync(path, `${JSON.stringify({ handoffs: handoffs.slice(0, 100) }, null, 2)}\n`);
 }
 
 function loadAgents(cwd: string): AgentProfile[] {
@@ -108,9 +147,22 @@ function compactJson(value: unknown, maxLength = 160): string {
 	return text.length > maxLength ? `${text.slice(0, maxLength - 1)}…` : text;
 }
 
-async function runSubagent(ctx: any, agent: AgentProfile, prompt: string): Promise<string> {
+async function runSubagent(ctx: any, agent: AgentProfile, prompt: string, task: string): Promise<{ result: string; sessionFile?: string }> {
 	if (!ctx.model) throw new Error("No model selected");
 	const progressEvents: string[] = [];
+	const now = new Date().toISOString();
+	const record: HandoffRecord = {
+		id: `handoff-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+		agentId: agent.id,
+		mode: "subagent",
+		status: "running",
+		task,
+		cwd: ctx.cwd,
+		parentSession: ctx.sessionManager.getSessionFile(),
+		createdAt: now,
+		updatedAt: now,
+	};
+	saveHandoff(ctx.cwd, record);
 	appendProgress(ctx, agent.id, "starting", progressEvents, "starting child session");
 
 	const loader = new DefaultResourceLoader({
@@ -130,11 +182,14 @@ async function runSubagent(ctx: any, agent: AgentProfile, prompt: string): Promi
 		thinkingLevel: ctx.thinkingLevel,
 		tools: agent.tools,
 		resourceLoader: loader,
-		sessionManager: SessionManager.inMemory(ctx.cwd),
+		sessionManager: SessionManager.create(ctx.cwd),
 		settingsManager,
 		authStorage: ctx.authStorage,
 		modelRegistry: ctx.modelRegistry,
 	});
+	record.childSession = session.sessionFile;
+	record.updatedAt = new Date().toISOString();
+	saveHandoff(ctx.cwd, record);
 
 	const unsubscribe = session.subscribe((event: any) => {
 		if (event.type === "agent_start") {
@@ -164,7 +219,16 @@ async function runSubagent(ctx: any, agent: AgentProfile, prompt: string): Promi
 	try {
 		await session.prompt(prompt);
 		appendProgress(ctx, agent.id, "completed", progressEvents, "result ready");
-		return extractAssistantText(session.messages as any[]);
+		record.status = "done";
+		record.updatedAt = new Date().toISOString();
+		saveHandoff(ctx.cwd, record);
+		return { result: extractAssistantText(session.messages as any[]), sessionFile: session.sessionFile };
+	} catch (error) {
+		record.status = "error";
+		record.error = error instanceof Error ? error.message : String(error);
+		record.updatedAt = new Date().toISOString();
+		saveHandoff(ctx.cwd, record);
+		throw error;
 	} finally {
 		unsubscribe();
 		session.dispose();
@@ -190,11 +254,16 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify("No agents configured. Create .pi/agents.json", "warning");
 				return;
 			}
-			ctx.ui.setEditorText(
-				agents
-					.map((agent) => `${agent.id}: ${agent.label ?? agent.id}\n${agent.description}\nTools: ${(agent.tools ?? []).join(", ") || "default"}`)
-					.join("\n\n"),
-			);
+			const handoffs = loadHandoffs(ctx.cwd).slice(0, 20);
+			const agentText = agents
+				.map((agent) => `${agent.id}: ${agent.label ?? agent.id}\n${agent.description}\nTools: ${(agent.tools ?? []).join(", ") || "default"}`)
+				.join("\n\n");
+			const handoffText = handoffs.length
+				? handoffs
+						.map((handoff) => `${handoff.status.toUpperCase()} ${handoff.agentId} ${handoff.mode}\nTask: ${handoff.task}\nSession: ${handoff.childSession ?? "pending"}\nUpdated: ${handoff.updatedAt}${handoff.error ? `\nError: ${handoff.error}` : ""}`)
+						.join("\n\n")
+				: "No handoffs recorded yet.";
+			ctx.ui.setEditorText(`Configured agents\n=================\n\n${agentText}\n\nRecent handoffs\n===============\n\n${handoffText}`);
 		},
 	});
 
@@ -212,7 +281,8 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify(`Unknown agent: ${parsed.agentId}`, "error");
 				return;
 			}
-			const prompt = buildHandoffPrompt(agent, parsed.task);
+			const task = parsed.task;
+			const prompt = buildHandoffPrompt(agent, task);
 			if (subcommand === "new") {
 				const parentSession = ctx.sessionManager.getSessionFile();
 				const result = await ctx.newSession({
@@ -225,21 +295,23 @@ export default function (pi: ExtensionAPI) {
 				if (result.cancelled) ctx.ui.notify("Handoff cancelled", "info");
 				return;
 			}
-			try {
-				ctx.ui.notify(`Running subagent ${agent.id}...`, "info");
-				const result = await runSubagent(ctx, agent, prompt);
-				const resultMessage = `Subagent ${agent.id} result:\n\n${result}`;
-				if (subcommand === "draft") {
-					ctx.ui.setEditorText(resultMessage);
-					ctx.ui.notify(`Subagent ${agent.id} completed; result inserted into editor`, "info");
-				} else {
-					await pi.sendUserMessage(resultMessage);
-					ctx.ui.notify(`Subagent ${agent.id} result sent to master`, "info");
+			ctx.ui.notify(`Started subagent ${agent.id} in background`, "info");
+			void (async () => {
+				try {
+					const { result, sessionFile } = await runSubagent(ctx, agent, prompt, task);
+					const resultMessage = `Subagent ${agent.id} result${sessionFile ? ` (session: ${sessionFile})` : ""}:\n\n${result}`;
+					if (subcommand === "draft") {
+						ctx.ui.setEditorText(resultMessage);
+						ctx.ui.notify(`Subagent ${agent.id} completed; result inserted into editor`, "info");
+					} else {
+						await pi.sendUserMessage(resultMessage);
+						ctx.ui.notify(`Subagent ${agent.id} result sent to master`, "info");
+					}
+				} catch (error) {
+					const message = error instanceof Error ? error.message : String(error);
+					ctx.ui.notify(`Subagent ${agent.id} failed: ${message}`, "error");
 				}
-			} catch (error) {
-				const message = error instanceof Error ? error.message : String(error);
-				ctx.ui.notify(`Subagent ${agent.id} failed: ${message}`, "error");
-			}
+			})();
 		},
 	});
 
@@ -275,8 +347,8 @@ export default function (pi: ExtensionAPI) {
 					details: { prompt, agentId: agent.id, mode: params.mode },
 				};
 			}
-			const result = await runSubagent(ctx, agent, prompt);
-			return { content: [{ type: "text", text: result }], details: { agentId: agent.id, mode: params.mode } };
+			const { result, sessionFile } = await runSubagent(ctx, agent, prompt, params.task);
+			return { content: [{ type: "text", text: result }], details: { agentId: agent.id, mode: params.mode, sessionFile } };
 		},
 	});
 }

@@ -34,8 +34,10 @@ cp ~/Dev/pi-extensions/pi-agent-handoff/examples/agents.json .pi/agents.json
 /agent draft <agent-id> <task>
 ```
 
-`/agent ask` sends the completed subagent result back to the master conversation.
-`/agent draft` leaves the completed subagent result in the editor for review/editing.
+`/agents` lists configured agents and recent handoffs. Subagent runs are persisted as normal pi sessions and recorded in `.pi/handoffs.json`.
+
+`/agent ask` starts the subagent in the background and sends the completed result back to the master conversation.
+`/agent draft` starts the subagent in the background and leaves the completed result in the editor for review/editing.
 
 ## Tools exposed to the model
 
