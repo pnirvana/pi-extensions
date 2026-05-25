@@ -85,8 +85,33 @@ function extractAssistantText(messages: any[]): string {
 	return "Subagent completed without a final text response.";
 }
 
+function renderSubagentWidget(agentId: string, status: string, events: string[]): string[] {
+	const recent = events.slice(-8);
+	return [`Subagent ${agentId}: ${status}`, ...recent.map((event) => `  ${event}`)];
+}
+
+function appendProgress(ctx: any, agentId: string, status: string, events: string[], event: string) {
+	events.push(event);
+	ctx.ui.setStatus("agent-handoff", `subagent ${agentId}: ${status}`);
+	ctx.ui.setWidget("agent-handoff", renderSubagentWidget(agentId, status, events), { placement: "belowEditor" });
+}
+
+function compactJson(value: unknown, maxLength = 160): string {
+	if (value === undefined || value === null) return "";
+	let text: string;
+	try {
+		text = typeof value === "string" ? value : JSON.stringify(value);
+	} catch {
+		text = String(value);
+	}
+	text = text.replace(/\s+/g, " ").trim();
+	return text.length > maxLength ? `${text.slice(0, maxLength - 1)}…` : text;
+}
+
 async function runSubagent(ctx: any, agent: AgentProfile, prompt: string): Promise<string> {
 	if (!ctx.model) throw new Error("No model selected");
+	const progressEvents: string[] = [];
+	appendProgress(ctx, agent.id, "starting", progressEvents, "starting child session");
 
 	const loader = new DefaultResourceLoader({
 		cwd: ctx.cwd,
@@ -111,11 +136,40 @@ async function runSubagent(ctx: any, agent: AgentProfile, prompt: string): Promi
 		modelRegistry: ctx.modelRegistry,
 	});
 
+	const unsubscribe = session.subscribe((event: any) => {
+		if (event.type === "agent_start") {
+			appendProgress(ctx, agent.id, "running", progressEvents, "agent started");
+		} else if (event.type === "turn_start") {
+			appendProgress(ctx, agent.id, "thinking", progressEvents, "thinking / planning next step");
+		} else if (event.type === "tool_execution_start") {
+			const args = compactJson(event.args);
+			appendProgress(ctx, agent.id, "tool", progressEvents, `tool started: ${event.toolName ?? "unknown"}${args ? ` ${args}` : ""}`);
+		} else if (event.type === "tool_execution_update") {
+			const partial = compactJson(event.partialResult, 120);
+			if (partial) appendProgress(ctx, agent.id, "tool", progressEvents, `tool update: ${event.toolName ?? "unknown"} ${partial}`);
+		} else if (event.type === "tool_execution_end") {
+			const result = compactJson(event.result, 160);
+			appendProgress(ctx, agent.id, "running", progressEvents, `tool finished: ${event.toolName ?? "unknown"}${event.isError ? " (error)" : ""}${result ? ` ${result}` : ""}`);
+		} else if (event.type === "message_update" && event.assistantMessageEvent?.type === "thinking_delta") {
+			const delta = String(event.assistantMessageEvent.delta ?? "").replace(/\s+/g, " ").trim();
+			if (delta) appendProgress(ctx, agent.id, "thinking", progressEvents, `thinking: ${delta.slice(0, 100)}`);
+		} else if (event.type === "message_update" && event.assistantMessageEvent?.type === "text_delta") {
+			const delta = String(event.assistantMessageEvent.delta ?? "").replace(/\s+/g, " ").trim();
+			if (delta) appendProgress(ctx, agent.id, "responding", progressEvents, `assistant: ${delta.slice(0, 100)}`);
+		} else if (event.type === "agent_end") {
+			appendProgress(ctx, agent.id, "finishing", progressEvents, "agent finished");
+		}
+	});
+
 	try {
 		await session.prompt(prompt);
+		appendProgress(ctx, agent.id, "completed", progressEvents, "result ready");
 		return extractAssistantText(session.messages as any[]);
 	} finally {
+		unsubscribe();
 		session.dispose();
+		ctx.ui.setStatus("agent-handoff", undefined);
+		ctx.ui.setWidget("agent-handoff", undefined);
 	}
 }
 
