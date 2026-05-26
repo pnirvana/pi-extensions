@@ -38,6 +38,19 @@ type HandoffRecord = {
 
 type HandoffStore = { handoffs: HandoffRecord[] };
 
+type HandoffCardDetails = {
+	id: string;
+	agentId: string;
+	mode: HandoffMode;
+	task: string;
+	prompt: string;
+	tools?: string[];
+	ephemeral?: boolean;
+	status: "started" | "completed" | "error" | "fire_and_forget";
+	sessionFile?: string;
+	error?: string;
+};
+
 type ActiveJob = {
 	id: string;
 	agentId: string;
@@ -232,6 +245,34 @@ function appendProgress(ctx: any, jobId: string, _agentId: string, status: strin
 	updateJob(ctx, jobId, status, event);
 }
 
+function renderHandoffCard(details: HandoffCardDetails, theme: any, expanded = false) {
+	const modeText = details.mode === "subagent" ? "subagent · master waits for result" : "fire-and-forget · user continues separately";
+	const statusColor = details.status === "completed" ? "success" : details.status === "error" ? "error" : details.status === "fire_and_forget" ? "warning" : "accent";
+	const lines = [
+		theme.fg("accent", "╭─ Agent handoff ─────────────────"),
+		`${theme.fg(statusColor, details.status.toUpperCase())}  ${modeText}`,
+		`to: ${details.agentId}${details.ephemeral ? " (ephemeral)" : ""}`,
+		`tools: ${(details.tools ?? []).join(", ") || "default"}`,
+		`task: ${details.task}`,
+		details.sessionFile ? `session: ${details.sessionFile}` : undefined,
+		details.error ? theme.fg("error", `error: ${details.error}`) : undefined,
+		theme.fg("accent", "╰─────────────────────────────────"),
+	]
+		.filter(Boolean)
+		.join("\n");
+	const prompt = expanded ? `\n\nPrompt sent to subagent:\n\n${details.prompt}` : "";
+	return new Text(`${lines}${prompt}`, 0, 0);
+}
+
+function sendHandoffCard(pi: ExtensionAPI, details: HandoffCardDetails) {
+	void pi.sendMessage({
+		customType: "agent-handoff-card",
+		content: `${details.mode} handoff to ${details.agentId}: ${details.task}`,
+		display: true,
+		details,
+	});
+}
+
 function compactJson(value: unknown, maxLength = 160): string {
 	if (value === undefined || value === null) return "";
 	let text: string;
@@ -244,7 +285,7 @@ function compactJson(value: unknown, maxLength = 160): string {
 	return text.length > maxLength ? `${text.slice(0, maxLength - 1)}…` : text;
 }
 
-async function runSubagent(ctx: any, agent: AgentProfile, prompt: string, task: string): Promise<{ result: string; sessionFile?: string }> {
+async function runSubagent(pi: ExtensionAPI, ctx: any, agent: AgentProfile, prompt: string, task: string, emitChatCards = false): Promise<{ result: string; sessionFile?: string }> {
 	if (!ctx.model) throw new Error("No model selected");
 	const progressEvents: string[] = [];
 	const now = new Date().toISOString();
@@ -294,6 +335,19 @@ async function runSubagent(ctx: any, agent: AgentProfile, prompt: string, task: 
 		authStorage: ctx.authStorage,
 		modelRegistry: ctx.modelRegistry,
 	});
+	if (emitChatCards) {
+		sendHandoffCard(pi, {
+			id: record.id,
+			agentId: agent.id,
+			mode: "subagent",
+			task,
+			prompt,
+			tools: agent.tools,
+			ephemeral: agent.ephemeral,
+			status: "started",
+			sessionFile: session.sessionFile,
+		});
+	}
 	record.childSession = session.sessionFile;
 	const activeJob = activeJobs.get(record.id);
 	if (activeJob) activeJob.childSession = session.sessionFile;
@@ -329,6 +383,19 @@ async function runSubagent(ctx: any, agent: AgentProfile, prompt: string, task: 
 		await session.prompt(prompt);
 		appendProgress(ctx, record.id, agent.id, "completed", progressEvents, "result ready");
 		finishJob(ctx, record.id, "done", "result ready");
+		if (emitChatCards) {
+			sendHandoffCard(pi, {
+				id: record.id,
+				agentId: agent.id,
+				mode: "subagent",
+				task,
+				prompt,
+				tools: agent.tools,
+				ephemeral: agent.ephemeral,
+				status: "completed",
+				sessionFile: session.sessionFile,
+			});
+		}
 		record.status = "done";
 		record.updatedAt = new Date().toISOString();
 		saveHandoff(ctx.cwd, record);
@@ -337,6 +404,20 @@ async function runSubagent(ctx: any, agent: AgentProfile, prompt: string, task: 
 		record.status = "error";
 		record.error = error instanceof Error ? error.message : String(error);
 		finishJob(ctx, record.id, "error", record.error);
+		if (emitChatCards) {
+			sendHandoffCard(pi, {
+				id: record.id,
+				agentId: agent.id,
+				mode: "subagent",
+				task,
+				prompt,
+				tools: agent.tools,
+				ephemeral: agent.ephemeral,
+				status: "error",
+				sessionFile: session.sessionFile,
+				error: record.error,
+			});
+		}
 		record.updatedAt = new Date().toISOString();
 		saveHandoff(ctx.cwd, record);
 		throw error;
@@ -429,6 +510,12 @@ function parseAgentCommand(args: string): { agentId?: string; task?: string } {
 }
 
 export default function (pi: ExtensionAPI) {
+	pi.registerMessageRenderer("agent-handoff-card", (message: any, options: any, theme: any) => {
+		const details = message.details as HandoffCardDetails | undefined;
+		if (!details) return new Text(message.content ?? "Agent handoff", 0, 0);
+		return renderHandoffCard(details, theme, options.expanded);
+	});
+
 	pi.registerCommand("agents", {
 		description: "Show configured handoff agents and recent handoffs",
 		handler: async (_args, ctx) => {
@@ -589,7 +676,7 @@ export default function (pi: ExtensionAPI) {
 			ctx.ui.notify(`Started subagent ${agent.id} in background`, "info");
 			void (async () => {
 				try {
-					const { result, sessionFile } = await runSubagent(ctx, agent, prompt, task);
+					const { result, sessionFile } = await runSubagent(pi, ctx, agent, prompt, task);
 					const resultMessage = `Subagent ${agent.id} result${sessionFile ? ` (session: ${sessionFile})` : ""}:\n\n${result}`;
 					if (subcommand === "draft") {
 						tryUi(ctx, () => {
@@ -641,7 +728,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerTool({
 		name: "handoff_to_agent",
-		label: "Handoff to Agent",
+		label: "Agent Handoff",
 		description: "Delegate work to a specialist agent. Use fire_and_forget for user-continuable sessions, subagent to wait for a result.",
 		parameters: Type.Object({
 			agentId: Type.Optional(Type.String({ description: "Configured agent id from list_agents, or an id for an ephemeral agent when agentDefinition is provided" })),
@@ -660,18 +747,62 @@ export default function (pi: ExtensionAPI) {
 			files: Type.Optional(Type.Array(Type.String())),
 			expectedOutput: Type.Optional(Type.String()),
 		}),
+		renderCall(params, theme) {
+			const agentId = params.agentId ?? params.agentDefinition?.id ?? params.agentDefinition?.label ?? "ephemeral-agent";
+			return renderHandoffCard(
+				{
+					id: "pending",
+					agentId,
+					mode: params.mode,
+					task: params.task,
+					prompt: "Prompt will be generated when the handoff executes.",
+					tools: params.agentDefinition?.tools,
+					ephemeral: Boolean(params.agentDefinition),
+					status: params.mode === "fire_and_forget" ? "fire_and_forget" : "started",
+				},
+				theme,
+				false,
+			);
+		},
+		renderResult(result, options, theme) {
+			const details = (result as any).details;
+			if (details?.handoffCard) return renderHandoffCard(details.handoffCard, theme, options.expanded);
+			return new Text((result as any).content?.[0]?.text ?? "Handoff complete", 0, 0);
+		},
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const agent = resolveAgent(ctx.cwd, params.agentId, params.agentDefinition);
 			if (!agent) return { content: [{ type: "text", text: `Unknown agent: ${params.agentId ?? "<none>"}. Provide a configured agentId or an agentDefinition for an ephemeral read-only agent.` }], isError: true, details: {} };
 			const prompt = buildHandoffPrompt(agent, params.task, params.context, params.files, params.expectedOutput);
 			if (params.mode === "fire_and_forget") {
+				const handoffCard: HandoffCardDetails = {
+					id: `handoff-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+					agentId: agent.id,
+					mode: "fire_and_forget",
+					task: params.task,
+					prompt,
+					tools: agent.tools,
+					ephemeral: agent.ephemeral,
+					status: "fire_and_forget",
+				};
+				sendHandoffCard(pi, handoffCard);
 				return {
 					content: [{ type: "text", text: `Fire-and-forget handoff prompt generated for ${agent.id}. Ask the user to run /agent new ${agent.id} <task> or start a new session with this prompt:\n\n${prompt}` }],
-					details: { prompt, agentId: agent.id, mode: params.mode },
+					details: { prompt, agentId: agent.id, mode: params.mode, handoffCard },
 				};
 			}
-			const { result, sessionFile } = await runSubagent(ctx, agent, prompt, params.task);
-			return { content: [{ type: "text", text: result }], details: { agentId: agent.id, mode: params.mode, sessionFile } };
+			const { result, sessionFile } = await runSubagent(pi, ctx, agent, prompt, params.task);
+			const handoffCard: HandoffCardDetails = {
+				id: `handoff-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+				agentId: agent.id,
+				mode: "subagent",
+				task: params.task,
+				prompt,
+				tools: agent.tools,
+				ephemeral: agent.ephemeral,
+				status: "completed",
+				sessionFile,
+			};
+			return { content: [{ type: "text", text: result }], details: { agentId: agent.id, mode: params.mode, sessionFile, handoffCard } };
 		},
 	});
 }
