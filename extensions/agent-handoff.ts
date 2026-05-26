@@ -729,8 +729,7 @@ export default function (pi: ExtensionAPI) {
 							ctx.ui.notify(`Subagent ${agent.id} completed; result inserted into editor`, "info");
 						});
 					} else {
-						await pi.sendUserMessage(resultMessage);
-						tryUi(ctx, () => ctx.ui.notify(`Subagent ${agent.id} result sent to master`, "info"));
+						tryUi(ctx, () => ctx.ui.notify(`Subagent ${agent.id} completed. Result stored in handoff session${sessionFile ? `: ${sessionFile}` : ""}`, "info"));
 					}
 				} catch (error) {
 					const message = error instanceof Error ? error.message : String(error);

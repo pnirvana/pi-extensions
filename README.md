@@ -40,7 +40,7 @@ cp ~/Dev/pi-extensions/pi-agent-handoff/examples/agents.json .pi/agents.json
 `/agent switch` switches the active pi TUI to a persisted child handoff session; `/agent switch parent` switches back when the current session has parent metadata.
 `/agent tmux` opens a persisted handoff session in a new tmux window.
 
-`/agent ask` starts the subagent in the background and sends the completed result back to the master conversation.
+`/agent ask` starts the subagent in the background and stores the result in the persisted handoff session without injecting it into the master conversation.
 `/agent draft` starts the subagent in the background and leaves the completed result in the editor for review/editing.
 
 ## Tools exposed to the model
