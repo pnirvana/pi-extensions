@@ -63,6 +63,7 @@ type ActiveJob = {
 };
 
 const activeJobs = new Map<string, ActiveJob>();
+const activeSessions = new Map<string, any>();
 const cleanupTimers = new Map<string, NodeJS.Timeout>();
 
 const execFileAsync = promisify(execFile);
@@ -226,6 +227,21 @@ function updateJob(ctx: any, jobId: string, status: string, action: string) {
 	refreshActiveJobsWidget(ctx);
 }
 
+function findActiveJob(selector?: string): ActiveJob | undefined {
+	const jobs = [...activeJobs.values()];
+	if (!selector || selector === "latest") return jobs.at(-1);
+	return jobs.find((job) => job.id === selector || job.id.startsWith(selector) || job.agentId === selector);
+}
+
+async function cancelActiveJob(ctx: any, selector?: string): Promise<boolean> {
+	const job = findActiveJob(selector);
+	if (!job) return false;
+	const session = activeSessions.get(job.id);
+	finishJob(ctx, job.id, "error", "cancel requested");
+	if (session) await session.abort();
+	return true;
+}
+
 function finishJob(ctx: any, jobId: string, status: "done" | "error", action: string) {
 	updateJob(ctx, jobId, status, action);
 	const existing = cleanupTimers.get(jobId);
@@ -349,6 +365,7 @@ async function runSubagent(pi: ExtensionAPI, ctx: any, agent: AgentProfile, prom
 		});
 	}
 	record.childSession = session.sessionFile;
+	activeSessions.set(record.id, session);
 	const activeJob = activeJobs.get(record.id);
 	if (activeJob) activeJob.childSession = session.sessionFile;
 	record.updatedAt = new Date().toISOString();
@@ -423,6 +440,7 @@ async function runSubagent(pi: ExtensionAPI, ctx: any, agent: AgentProfile, prom
 		throw error;
 	} finally {
 		unsubscribe();
+		activeSessions.delete(record.id);
 		session.dispose();
 		tryUi(ctx, () => ctx.ui.setWidget("agent-handoff-detail", undefined));
 	}
@@ -466,10 +484,12 @@ function getParentSession(ctx: any): string | undefined {
 	return loadHandoffs(ctx.cwd).find((handoff) => handoff.childSession === currentSession)?.parentSession;
 }
 
-type DashboardAction = { action: "switch" | "tmux"; session: string; label: string };
+type DashboardAction = { action: "switch" | "tmux" | "cancel"; session?: string; label: string; jobId?: string };
 
-function dashboardItems(cwd: string, parentSession?: string): SelectItem[] {
-	const items: SelectItem[] = [];
+type DashboardItem = SelectItem & { jobId?: string; active?: boolean };
+
+function dashboardItems(cwd: string, parentSession?: string): DashboardItem[] {
+	const items: DashboardItem[] = [];
 	if (parentSession) {
 		items.push({
 			value: parentSession,
@@ -484,6 +504,8 @@ function dashboardItems(cwd: string, parentSession?: string): SelectItem[] {
 			value: job.childSession!,
 			label: `● ACTIVE ${job.agentId}: ${truncateToWidth(job.task, 80)}`,
 			description: `${job.status}: ${truncateToWidth(job.action, 100)}`,
+			jobId: job.id,
+			active: true,
 		})),
 	);
 
@@ -562,14 +584,19 @@ export default function (pi: ExtensionAPI) {
 						selectedItem = item;
 					};
 					container.addChild(selectList);
-					container.addChild(new Text(theme.fg("dim", "↑↓ navigate • enter switch • t open in tmux • esc close"), 1, 0));
+					container.addChild(new Text(theme.fg("dim", "↑↓ navigate • enter switch • t tmux • c cancel active • esc close"), 1, 0));
 					container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
 					return {
 						render: (width: number) => container.render(width),
 						invalidate: () => container.invalidate(),
 						handleInput: (data: string) => {
+							const dashboardItem = selectedItem as DashboardItem;
 							if (data === "t" && selectedItem) {
 								done({ action: "tmux", session: selectedItem.value, label: selectedItem.label });
+								return;
+							}
+							if (data === "c" && dashboardItem.active && dashboardItem.jobId) {
+								done({ action: "cancel", label: dashboardItem.label, jobId: dashboardItem.jobId });
 								return;
 							}
 							selectList.handleInput?.(data);
@@ -588,12 +615,18 @@ export default function (pi: ExtensionAPI) {
 			});
 
 			if (selectedAction) {
-				if (activeJobs.size > 0 && [...activeJobs.values()].some((job) => job.childSession === selectedAction.session)) {
+				if (selectedAction.action === "cancel") {
+					const cancelled = await cancelActiveJob(ctx, selectedAction.jobId);
+					ctx.ui.notify(cancelled ? `Cancel requested: ${selectedAction.label}` : `No active subagent found: ${selectedAction.label}`, cancelled ? "info" : "warning");
+					return;
+				}
+				if (selectedAction.session && activeJobs.size > 0 && [...activeJobs.values()].some((job) => job.childSession === selectedAction.session)) {
 					ctx.ui.notify("That subagent is still running. Wait until it finishes before switching/opening to avoid concurrent session access.", "warning");
 					return;
 				}
 				if (selectedAction.action === "tmux") {
 					try {
+						if (!selectedAction.session) return;
 						await openSessionInTmux(ctx.cwd, selectedAction.session, selectedAction.label);
 						ctx.ui.notify("Opened handoff session in tmux", "info");
 					} catch (error) {
@@ -601,6 +634,7 @@ export default function (pi: ExtensionAPI) {
 						ctx.ui.notify(`Failed to open tmux window: ${message}`, "error");
 					}
 				} else {
+					if (!selectedAction.session) return;
 					const result = await ctx.switchSession(selectedAction.session, {
 						withSession: async (replacementCtx) => replacementCtx.ui.notify("Switched to handoff session", "info"),
 					});
@@ -611,9 +645,20 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("agent", {
-		description: "Agent handoff commands: /agent new|ask|draft <agent-id> <task>, /agent switch [handoff-id|agent-id|latest|parent], /agent tmux [handoff-id|agent-id|latest|parent]",
+		description: "Agent handoff commands: /agent new|ask|draft <agent-id> <task>, /agent cancel [job-id|agent-id|latest], /agent switch [handoff-id|agent-id|latest|parent], /agent tmux [handoff-id|agent-id|latest|parent]",
 		handler: async (args, ctx) => {
 			const [subcommand, ...rest] = args.trim().split(/\s+/);
+			if (subcommand === "cancel") {
+				const selector = rest.join(" ").trim() || "latest";
+				try {
+					const cancelled = await cancelActiveJob(ctx, selector);
+					ctx.ui.notify(cancelled ? `Cancel requested for ${selector}` : `No active subagent found for: ${selector}`, cancelled ? "info" : "warning");
+				} catch (error) {
+					const message = error instanceof Error ? error.message : String(error);
+					ctx.ui.notify(`Failed to cancel subagent: ${message}`, "error");
+				}
+				return;
+			}
 			if (subcommand === "switch" || subcommand === "tmux") {
 				const selector = rest.join(" ").trim() || "latest";
 				let targetSession: string | undefined;
@@ -651,7 +696,7 @@ export default function (pi: ExtensionAPI) {
 
 			const parsed = parseAgentCommand(rest.join(" "));
 			if (!subcommand || !["new", "ask", "draft"].includes(subcommand) || !parsed.agentId || !parsed.task) {
-				ctx.ui.notify("Usage: /agent new <agent-id> <task>, /agent ask <agent-id> <task>, /agent draft <agent-id> <task>, /agent switch [handoff-id|agent-id|latest|parent], or /agent tmux [handoff-id|agent-id|latest|parent]", "error");
+				ctx.ui.notify("Usage: /agent new <agent-id> <task>, /agent ask <agent-id> <task>, /agent draft <agent-id> <task>, /agent cancel [job-id|agent-id|latest], /agent switch [handoff-id|agent-id|latest|parent], or /agent tmux [handoff-id|agent-id|latest|parent]", "error");
 				return;
 			}
 			const agent = findAgent(ctx.cwd, parsed.agentId);
