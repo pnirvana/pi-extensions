@@ -17,6 +17,7 @@ type AgentProfile = {
 	model?: string;
 	tools?: string[];
 	systemPrompt?: string;
+	ephemeral?: boolean;
 };
 
 type AgentsConfig = { agents?: AgentProfile[] };
@@ -54,6 +55,8 @@ const cleanupTimers = new Map<string, NodeJS.Timeout>();
 const execFileAsync = promisify(execFile);
 
 const DEFAULT_SYSTEM_PROMPT = `You are a focused specialist subagent. Complete only the delegated task. Be concise, concrete, and return findings or completed work clearly.`;
+const DEFAULT_EPHEMERAL_TOOLS = ["read", "grep", "find", "ls"];
+const ALLOWED_EPHEMERAL_TOOLS = new Set(["read", "grep", "find", "ls"]);
 
 function configPaths(cwd: string): string[] {
 	return [join(cwd, ".pi", "agents.json"), join(cwd, "agents.json"), join(homedir(), ".pi", "agent", "agents.json")];
@@ -102,8 +105,37 @@ function agentSummary(agent: AgentProfile) {
 	};
 }
 
+function sanitizeAgentId(value: string): string {
+	return value.toLowerCase().replace(/[^a-z0-9_.:-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 60) || "ephemeral-agent";
+}
+
+function sanitizeEphemeralTools(tools?: string[]): string[] {
+	const requested = tools && tools.length > 0 ? tools : DEFAULT_EPHEMERAL_TOOLS;
+	return requested.filter((tool) => ALLOWED_EPHEMERAL_TOOLS.has(tool));
+}
+
 function findAgent(cwd: string, id: string): AgentProfile | undefined {
 	return loadAgents(cwd).find((agent) => agent.id === id);
+}
+
+function resolveAgent(cwd: string, agentId: string | undefined, definition?: Partial<AgentProfile>): AgentProfile | undefined {
+	if (agentId) {
+		const configured = findAgent(cwd, agentId);
+		if (configured) return configured;
+	}
+	if (!definition?.description && !definition?.systemPrompt) return undefined;
+	const id = sanitizeAgentId(definition.id ?? agentId ?? definition.label ?? "ephemeral-agent");
+	return {
+		id,
+		label: definition.label ?? id,
+		description: definition.description ?? `Ephemeral agent ${id}`,
+		model: definition.model,
+		tools: sanitizeEphemeralTools(definition.tools),
+		systemPrompt:
+			definition.systemPrompt ??
+			`You are an ephemeral codebase exploration subagent. Explore the delegated aspect using read-only tools. Return a concise synthesis and do not include raw file contents unless essential.`,
+		ephemeral: true,
+	};
 }
 
 function buildHandoffPrompt(agent: AgentProfile, task: string, context?: string, files?: string[], expectedOutput?: string): string {
@@ -154,10 +186,22 @@ function renderActiveJobs(): string[] {
 	return [`Subagents (${jobs.length})`, ...visible];
 }
 
+function tryUi(ctx: any, fn: () => void) {
+	try {
+		fn();
+	} catch {
+		// The command ctx can become stale after session switch/reload while a
+		// background subagent is still running. Ignore UI updates in that case;
+		// persisted handoff records still get updated.
+	}
+}
+
 function refreshActiveJobsWidget(ctx: any) {
 	const lines = renderActiveJobs();
-	ctx.ui.setWidget("agent-handoff-active", lines.length ? lines : undefined, { placement: "belowEditor" });
-	ctx.ui.setStatus("agent-handoff-active", lines.length ? `subagents: ${activeJobs.size}` : undefined);
+	tryUi(ctx, () => {
+		ctx.ui.setWidget("agent-handoff-active", lines.length ? lines : undefined, { placement: "belowEditor" });
+		ctx.ui.setStatus("agent-handoff-active", lines.length ? `subagents: ${activeJobs.size}` : undefined);
+	});
 }
 
 function updateJob(ctx: any, jobId: string, status: string, action: string) {
@@ -299,7 +343,7 @@ async function runSubagent(ctx: any, agent: AgentProfile, prompt: string, task: 
 	} finally {
 		unsubscribe();
 		session.dispose();
-		ctx.ui.setWidget("agent-handoff-detail", undefined);
+		tryUi(ctx, () => ctx.ui.setWidget("agent-handoff-detail", undefined));
 	}
 }
 
@@ -352,7 +396,20 @@ function dashboardItems(cwd: string, parentSession?: string): SelectItem[] {
 			description: parentSession,
 		});
 	}
-	const handoffs = loadHandoffs(cwd).filter((handoff) => handoff.childSession).slice(0, 20);
+
+	const active = [...activeJobs.values()].filter((job) => job.childSession).sort((a, b) => a.startedAt - b.startedAt);
+	items.push(
+		...active.map((job) => ({
+			value: job.childSession!,
+			label: `● ACTIVE ${job.agentId}: ${truncateToWidth(job.task, 80)}`,
+			description: `${job.status}: ${truncateToWidth(job.action, 100)}`,
+		})),
+	);
+
+	const activeSessions = new Set(active.map((job) => job.childSession));
+	const handoffs = loadHandoffs(cwd)
+		.filter((handoff) => handoff.childSession && !activeSessions.has(handoff.childSession))
+		.slice(0, 20);
 	items.push(
 		...handoffs.map((handoff) => ({
 			value: handoff.childSession!,
@@ -391,13 +448,16 @@ export default function (pi: ExtensionAPI) {
 				const items = dashboardItems(ctx.cwd, parentSession);
 
 				container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
+				const activeCount = [...activeJobs.values()].filter((job) => job.childSession).length;
 				container.addChild(new Text(theme.fg("accent", theme.bold("Agent handoff dashboard")), 1, 0));
-				container.addChild(new Text(theme.fg("dim", `${agents.length} configured agents · ${items.length} persisted handoff sessions · use /agent tmux <id> to open in tmux`), 1, 0));
+				container.addChild(new Text(theme.fg("dim", `${agents.length} configured agents · ${activeCount} active · ${items.length} selectable sessions`), 1, 0));
 
 				if (items.length === 0) {
-					container.addChild(new Text("No persisted handoff sessions yet. Run /agent ask <agent-id> <task> first.", 1, 1));
+					container.addChild(new Text("No handoff sessions yet. Run /agent ask <agent-id> <task> first.", 1, 1));
 				} else {
 					let selectedItem = items[0];
+					const currentSession = ctx.sessionManager.getSessionFile();
+					const initialIndex = currentSession ? items.findIndex((item) => item.value === currentSession) : -1;
 					const selectList = new SelectList(items, Math.min(items.length, 12), {
 						selectedPrefix: (text: string) => theme.fg("accent", text),
 						selectedText: (text: string) => theme.fg("accent", text),
@@ -405,6 +465,10 @@ export default function (pi: ExtensionAPI) {
 						scrollInfo: (text: string) => theme.fg("dim", text),
 						noMatch: (text: string) => theme.fg("warning", text),
 					});
+					if (initialIndex >= 0) {
+						selectList.setSelectedIndex(initialIndex);
+						selectedItem = items[initialIndex];
+					}
 					selectList.onSelect = (item) => done({ action: "switch", session: item.value, label: item.label });
 					selectList.onCancel = () => done(undefined);
 					selectList.onSelectionChange = (item) => {
@@ -434,9 +498,13 @@ export default function (pi: ExtensionAPI) {
 					invalidate: () => container.invalidate(),
 					handleInput: () => done(undefined),
 				};
-			}, { overlay: true, overlayOptions: { width: "90%", maxHeight: "80%" } });
+			});
 
 			if (selectedAction) {
+				if (activeJobs.size > 0 && [...activeJobs.values()].some((job) => job.childSession === selectedAction.session)) {
+					ctx.ui.notify("That subagent is still running. Wait until it finishes before switching/opening to avoid concurrent session access.", "warning");
+					return;
+				}
 				if (selectedAction.action === "tmux") {
 					try {
 						await openSessionInTmux(ctx.cwd, selectedAction.session, selectedAction.label);
@@ -524,15 +592,17 @@ export default function (pi: ExtensionAPI) {
 					const { result, sessionFile } = await runSubagent(ctx, agent, prompt, task);
 					const resultMessage = `Subagent ${agent.id} result${sessionFile ? ` (session: ${sessionFile})` : ""}:\n\n${result}`;
 					if (subcommand === "draft") {
-						ctx.ui.setEditorText(resultMessage);
-						ctx.ui.notify(`Subagent ${agent.id} completed; result inserted into editor`, "info");
+						tryUi(ctx, () => {
+							ctx.ui.setEditorText(resultMessage);
+							ctx.ui.notify(`Subagent ${agent.id} completed; result inserted into editor`, "info");
+						});
 					} else {
 						await pi.sendUserMessage(resultMessage);
-						ctx.ui.notify(`Subagent ${agent.id} result sent to master`, "info");
+						tryUi(ctx, () => ctx.ui.notify(`Subagent ${agent.id} result sent to master`, "info"));
 					}
 				} catch (error) {
 					const message = error instanceof Error ? error.message : String(error);
-					ctx.ui.notify(`Subagent ${agent.id} failed: ${message}`, "error");
+					tryUi(ctx, () => ctx.ui.notify(`Subagent ${agent.id} failed: ${message}`, "error"));
 				}
 			})();
 		},
@@ -541,10 +611,31 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "list_agents",
 		label: "List Agents",
-		description: "List available specialist agents that can receive handoffs.",
+		description: "List available specialist agents that can receive handoffs. The handoff_to_agent tool may also create ephemeral read-only agents with agentDefinition.",
 		parameters: Type.Object({}),
 		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
-			return { content: [{ type: "text", text: JSON.stringify(loadAgents(ctx.cwd).map(agentSummary), null, 2) }], details: {} };
+			const agents = loadAgents(ctx.cwd).map(agentSummary);
+			return {
+				content: [
+					{
+						type: "text",
+						text: JSON.stringify(
+							{
+								configuredAgents: agents,
+								ephemeralAgents: {
+									supported: true,
+									defaultTools: DEFAULT_EPHEMERAL_TOOLS,
+									allowedTools: [...ALLOWED_EPHEMERAL_TOOLS],
+									note: "Use handoff_to_agent.agentDefinition for task-specific read-only exploration agents.",
+								},
+							},
+							null,
+							2,
+						),
+					},
+				],
+				details: {},
+			};
 		},
 	});
 
@@ -553,7 +644,16 @@ export default function (pi: ExtensionAPI) {
 		label: "Handoff to Agent",
 		description: "Delegate work to a specialist agent. Use fire_and_forget for user-continuable sessions, subagent to wait for a result.",
 		parameters: Type.Object({
-			agentId: Type.String({ description: "Agent id from list_agents" }),
+			agentId: Type.Optional(Type.String({ description: "Configured agent id from list_agents, or an id for an ephemeral agent when agentDefinition is provided" })),
+			agentDefinition: Type.Optional(
+				Type.Object({
+					id: Type.Optional(Type.String({ description: "Ephemeral agent id" })),
+					label: Type.Optional(Type.String()),
+					description: Type.String({ description: "What this ephemeral agent specializes in" }),
+					tools: Type.Optional(Type.Array(Type.String({ description: "Read-only tools only: read, grep, find, ls" }))),
+					systemPrompt: Type.Optional(Type.String({ description: "Custom system prompt for the ephemeral agent" })),
+				}),
+			),
 			mode: Type.Union([Type.Literal("fire_and_forget"), Type.Literal("subagent")]),
 			task: Type.String({ description: "Delegated task" }),
 			context: Type.Optional(Type.String()),
@@ -561,8 +661,8 @@ export default function (pi: ExtensionAPI) {
 			expectedOutput: Type.Optional(Type.String()),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			const agent = findAgent(ctx.cwd, params.agentId);
-			if (!agent) return { content: [{ type: "text", text: `Unknown agent: ${params.agentId}` }], isError: true, details: {} };
+			const agent = resolveAgent(ctx.cwd, params.agentId, params.agentDefinition);
+			if (!agent) return { content: [{ type: "text", text: `Unknown agent: ${params.agentId ?? "<none>"}. Provide a configured agentId or an agentDefinition for an ephemeral read-only agent.` }], isError: true, details: {} };
 			const prompt = buildHandoffPrompt(agent, params.task, params.context, params.files, params.expectedOutput);
 			if (params.mode === "fire_and_forget") {
 				return {

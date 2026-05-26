@@ -45,7 +45,9 @@ cp ~/Dev/pi-extensions/pi-agent-handoff/examples/agents.json .pi/agents.json
 
 ## Tools exposed to the model
 
-- `list_agents`: list available specialist agents.
-- `handoff_to_agent`: delegate to an agent in `fire_and_forget` or `subagent` mode.
+- `list_agents`: list available specialist agents and describe ephemeral agent support.
+- `handoff_to_agent`: delegate to a configured agent or create an ephemeral read-only task-specific agent via `agentDefinition`.
+
+Ephemeral agents are useful for codebase exploration without polluting the master context. They are restricted to read-only tools by default: `read`, `grep`, `find`, `ls`.
 
 See `docs/design.md` for details.
