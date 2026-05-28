@@ -1,0 +1,13 @@
+{
+  "name": "pi-extensions",
+  "version": "0.1.0",
+  "private": true,
+  "keywords": [
+    "pi-package"
+  ],
+  "pi": {
+    "extensions": [
+      "./pi-agent-handoff/extensions"
+    ]
+  }
+}
