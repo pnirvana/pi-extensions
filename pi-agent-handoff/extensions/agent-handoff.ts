@@ -523,6 +523,36 @@ function dashboardItems(cwd: string, parentSession?: string): DashboardItem[] {
 	return items;
 }
 
+const AGENT_HELP = `# Agent handoff commands
+
+## Dashboard
+/agents
+: Open the agent handoff dashboard.
+
+## Start agents
+/agent new <agent-id> <task>
+: Create a new handoff session draft for the user to continue.
+
+/agent ask <agent-id> <task>
+: Start a background subagent and store its result in the child session. Does not inject the result into the master chat.
+
+/agent draft <agent-id> <task>
+: Start a background subagent and place the final result in the editor for review.
+
+## Manage running agents
+/agent cancel [job-id|agent-id|latest]
+: Cancel a running subagent.
+
+## Navigate sessions
+/agent switch [handoff-id|agent-id|latest|parent]
+: Switch the main TUI to a handoff or parent session.
+
+/agent tmux [handoff-id|agent-id|latest|parent]
+: Open a handoff or parent session in a new tmux window.
+
+## Model tool use
+The master agent can use list_agents and handoff_to_agent. handoff_to_agent also supports ephemeral read-only agents via agentDefinition.`;
+
 function parseAgentCommand(args: string): { agentId?: string; task?: string } {
 	const trimmed = args.trim();
 	const firstSpace = trimmed.indexOf(" ");
@@ -645,9 +675,13 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("agent", {
-		description: "Agent handoff commands: /agent new|ask|draft <agent-id> <task>, /agent cancel [job-id|agent-id|latest], /agent switch [handoff-id|agent-id|latest|parent], /agent tmux [handoff-id|agent-id|latest|parent]",
+		description: "Manage agent handoffs and subagents. Use /agent help for usage.",
 		handler: async (args, ctx) => {
 			const [subcommand, ...rest] = args.trim().split(/\s+/);
+			if (!subcommand || subcommand === "help") {
+				ctx.ui.setEditorText(AGENT_HELP);
+				return;
+			}
 			if (subcommand === "cancel") {
 				const selector = rest.join(" ").trim() || "latest";
 				try {
