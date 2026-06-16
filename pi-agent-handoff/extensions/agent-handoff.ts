@@ -301,8 +301,21 @@ function compactJson(value: unknown, maxLength = 160): string {
 	return text.length > maxLength ? `${text.slice(0, maxLength - 1)}…` : text;
 }
 
+function resolveAgentModel(ctx: any, agent: AgentProfile): { model: any; thinkingLevel: any } {
+	if (!agent.model) return { model: ctx.model, thinkingLevel: ctx.thinkingLevel };
+	const [modelSpec, thinkingLevel] = agent.model.split(":", 2);
+	const slash = modelSpec.indexOf("/");
+	if (slash < 0) throw new Error(`Invalid model for agent ${agent.id}: ${agent.model}. Expected provider/model or provider/model:thinking`);
+	const provider = modelSpec.slice(0, slash);
+	const modelId = modelSpec.slice(slash + 1);
+	const model = ctx.modelRegistry.find(provider, modelId);
+	if (!model) throw new Error(`Model not found for agent ${agent.id}: ${agent.model}`);
+	return { model, thinkingLevel: thinkingLevel ?? ctx.thinkingLevel };
+}
+
 async function runSubagent(pi: ExtensionAPI, ctx: any, agent: AgentProfile, prompt: string, task: string, emitChatCards = false): Promise<{ result: string; sessionFile?: string }> {
 	if (!ctx.model) throw new Error("No model selected");
+	const agentModel = resolveAgentModel(ctx, agent);
 	const progressEvents: string[] = [];
 	const now = new Date().toISOString();
 	const record: HandoffRecord = {
@@ -342,8 +355,8 @@ async function runSubagent(pi: ExtensionAPI, ctx: any, agent: AgentProfile, prom
 
 	const { session } = await createAgentSession({
 		cwd: ctx.cwd,
-		model: ctx.model,
-		thinkingLevel: ctx.thinkingLevel,
+		model: agentModel.model,
+		thinkingLevel: agentModel.thinkingLevel,
 		tools: agent.tools,
 		resourceLoader: loader,
 		sessionManager: SessionManager.create(ctx.cwd),

@@ -34,6 +34,8 @@ pi -e ./extensions/agent-handoff.ts
 
 ## Configure agents
 
+Agents may specify an optional `model` using `provider/model` or `provider/model:thinking`, for example `anthropic/claude-haiku-4-5` or `anthropic/claude-sonnet-4-5:low`. If omitted, the subagent uses the master's current model and thinking level.
+
 Copy the example config into a project:
 
 ```bash

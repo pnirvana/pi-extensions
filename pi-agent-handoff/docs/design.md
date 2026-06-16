@@ -26,11 +26,13 @@ type AgentProfile = {
   id: string;
   label?: string;
   description: string;
-  model?: string;
+  model?: string; // provider/model or provider/model:thinking
   tools?: string[];
   systemPrompt?: string;
 };
 ```
+
+If `model` is omitted, the subagent uses the master's current model and thinking level. If present, the extension resolves it through pi's model registry. Supported format is `provider/model` with optional thinking suffix, e.g. `anthropic/claude-sonnet-4-5:low`.
 
 Example config is in `examples/agents.json`.
 

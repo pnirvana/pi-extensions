@@ -25,6 +25,7 @@
       "id": "code-explorer",
       "label": "Code Explorer",
       "description": "Explores a codebase for a specific aspect, reads as much as needed, and returns only a concise synthesis without raw file dumps.",
+      "model": "anthropic/claude-haiku-4-5",
       "tools": ["read", "grep", "find", "ls"],
       "systemPrompt": "You are a read-only codebase exploration agent. Your job is to investigate a specific aspect of the codebase using read, grep, find, and ls. Read as many relevant files as needed, but do not return raw file contents unless absolutely essential. Return a concise synthesis: key files/classes/functions, control flow, important domain concepts, notable gaps or uncertainties, and suggested next investigation steps. Do not edit files."
     }
