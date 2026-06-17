@@ -132,10 +132,10 @@ function findAgent(cwd: string, id: string): AgentProfile | undefined {
 	return loadAgents(cwd).find((agent) => agent.id === id);
 }
 
-function resolveAgent(cwd: string, agentId: string | undefined, definition?: Partial<AgentProfile>): AgentProfile | undefined {
+function resolveAgent(cwd: string, agentId: string | undefined, definition?: Partial<AgentProfile>, modelOverride?: string): AgentProfile | undefined {
 	if (agentId) {
 		const configured = findAgent(cwd, agentId);
-		if (configured) return configured;
+		if (configured) return { ...configured, model: modelOverride ?? configured.model };
 	}
 	if (!definition?.description && !definition?.systemPrompt) return undefined;
 	const id = sanitizeAgentId(definition.id ?? agentId ?? definition.label ?? "ephemeral-agent");
@@ -143,7 +143,7 @@ function resolveAgent(cwd: string, agentId: string | undefined, definition?: Par
 		id,
 		label: definition.label ?? id,
 		description: definition.description ?? `Ephemeral agent ${id}`,
-		model: definition.model,
+		model: modelOverride ?? definition.model,
 		tools: sanitizeEphemeralTools(definition.tools),
 		systemPrompt:
 			definition.systemPrompt ??
@@ -829,10 +829,12 @@ export default function (pi: ExtensionAPI) {
 					label: Type.Optional(Type.String()),
 					description: Type.String({ description: "What this ephemeral agent specializes in" }),
 					tools: Type.Optional(Type.Array(Type.String({ description: "Read-only tools only: read, grep, find, ls" }))),
+					model: Type.Optional(Type.String({ description: "Model spec for this ephemeral agent, e.g. github-copilot/gpt-5.5:low" })),
 					systemPrompt: Type.Optional(Type.String({ description: "Custom system prompt for the ephemeral agent" })),
 				}),
 			),
 			mode: Type.Union([Type.Literal("fire_and_forget"), Type.Literal("subagent")]),
+			model: Type.Optional(Type.String({ description: "Optional model override for this handoff, e.g. github-copilot/gpt-5.5:low" })),
 			task: Type.String({ description: "Delegated task" }),
 			context: Type.Optional(Type.String()),
 			files: Type.Optional(Type.Array(Type.String())),
@@ -861,7 +863,7 @@ export default function (pi: ExtensionAPI) {
 			return new Text((result as any).content?.[0]?.text ?? "Handoff complete", 0, 0);
 		},
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			const agent = resolveAgent(ctx.cwd, params.agentId, params.agentDefinition);
+			const agent = resolveAgent(ctx.cwd, params.agentId, params.agentDefinition, params.model);
 			if (!agent) return { content: [{ type: "text", text: `Unknown agent: ${params.agentId ?? "<none>"}. Provide a configured agentId or an agentDefinition for an ephemeral read-only agent.` }], isError: true, details: {} };
 			const prompt = buildHandoffPrompt(agent, params.task, params.context, params.files, params.expectedOutput);
 			if (params.mode === "fire_and_forget") {

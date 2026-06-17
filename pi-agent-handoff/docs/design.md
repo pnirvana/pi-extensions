@@ -80,6 +80,8 @@ read, grep, find, ls
 
 If no tools are specified, those read-only tools are used by default.
 
+A specific model can be selected per handoff either with top-level `model` or `agentDefinition.model`. Top-level `model` overrides the configured or ephemeral agent model for that single handoff.
+
 ## Persistence
 
 Every subagent run creates a normal pi session via `SessionManager.create(ctx.cwd)`.

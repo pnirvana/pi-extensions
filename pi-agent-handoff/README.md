@@ -116,6 +116,8 @@ The extension exposes two tools to the master agent:
 
 The master can create task-specific read-only agents with `agentDefinition`. This is useful for codebase exploration without polluting the master context with raw file contents.
 
+The master can also choose a model for a specific handoff with top-level `model`, or inside `agentDefinition.model`, using the same `provider/model:thinking` format.
+
 Ephemeral agents are restricted to read-only tools:
 
 ```text
