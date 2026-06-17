@@ -543,13 +543,13 @@ const AGENT_HELP = `# Agent handoff commands
 : Open the agent handoff dashboard.
 
 ## Start agents
-/agent new <agent-id> <task>
+/agent new <agent-id> [--model <provider/model[:thinking]>] <task>
 : Create a new handoff session draft for the user to continue.
 
-/agent ask <agent-id> <task>
+/agent ask <agent-id> [--model <provider/model[:thinking]>] <task>
 : Start a background subagent and store its result in the child session. Does not inject the result into the master chat.
 
-/agent draft <agent-id> <task>
+/agent draft <agent-id> [--model <provider/model[:thinking]>] <task>
 : Start a background subagent and place the final result in the editor for review.
 
 ## Manage running agents
@@ -566,12 +566,28 @@ const AGENT_HELP = `# Agent handoff commands
 ## Model tool use
 The master agent can use list_agents and handoff_to_agent. handoff_to_agent also supports ephemeral read-only agents via agentDefinition.`;
 
-function parseAgentCommand(args: string): { agentId?: string; task?: string } {
+function parseAgentCommand(args: string): { agentId?: string; task?: string; model?: string } {
 	const trimmed = args.trim();
 	const firstSpace = trimmed.indexOf(" ");
 	if (!trimmed) return {};
 	if (firstSpace < 0) return { agentId: trimmed };
-	return { agentId: trimmed.slice(0, firstSpace), task: trimmed.slice(firstSpace + 1).trim() };
+	const agentId = trimmed.slice(0, firstSpace);
+	let task = trimmed.slice(firstSpace + 1).trim();
+	let model: string | undefined;
+
+	const equalsMatch = task.match(/(?:^|\s)--model=([^\s]+)(?:\s|$)/);
+	if (equalsMatch?.[1]) {
+		model = equalsMatch[1];
+		task = task.replace(equalsMatch[0], " ").trim();
+	} else {
+		const separateMatch = task.match(/(?:^|\s)--model\s+([^\s]+)(?:\s|$)/);
+		if (separateMatch?.[1]) {
+			model = separateMatch[1];
+			task = task.replace(separateMatch[0], " ").trim();
+		}
+	}
+
+	return { agentId, task, model };
 }
 
 export default function (pi: ExtensionAPI) {
@@ -746,7 +762,8 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify("Usage: /agent new <agent-id> <task>, /agent ask <agent-id> <task>, /agent draft <agent-id> <task>, /agent cancel [job-id|agent-id|latest], /agent switch [handoff-id|agent-id|latest|parent], or /agent tmux [handoff-id|agent-id|latest|parent]", "error");
 				return;
 			}
-			const agent = findAgent(ctx.cwd, parsed.agentId);
+			const configuredAgent = findAgent(ctx.cwd, parsed.agentId);
+			const agent = configuredAgent ? { ...configuredAgent, model: parsed.model ?? configuredAgent.model } : undefined;
 			if (!agent) {
 				ctx.ui.notify(`Unknown agent: ${parsed.agentId}`, "error");
 				return;

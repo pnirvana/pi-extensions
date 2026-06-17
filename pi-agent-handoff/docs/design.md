@@ -65,6 +65,7 @@ Runs a focused SDK-managed `AgentSession` using the selected agent's prompt and 
 - Model-triggered subagents return a tool result to the master agent.
 - User-command subagents run in the background and do not inject results into the master chat.
 - `/agent draft` puts the result in the editor for review.
+- `/agent new`, `/agent ask`, and `/agent draft` accept `--model <provider/model[:thinking]>` or `--model=<provider/model[:thinking]>` as a one-off override.
 
 ## Ephemeral agents
 

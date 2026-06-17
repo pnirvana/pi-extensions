@@ -54,9 +54,9 @@ The extension searches for agents in:
 ```text
 /agents
 /agent help
-/agent new <agent-id> <task>
-/agent ask <agent-id> <task>
-/agent draft <agent-id> <task>
+/agent new <agent-id> [--model <provider/model[:thinking]>] <task>
+/agent ask <agent-id> [--model <provider/model[:thinking]>] <task>
+/agent draft <agent-id> [--model <provider/model[:thinking]>] <task>
 /agent cancel [job-id|agent-id|latest]
 /agent switch [handoff-id|agent-id|latest|parent]
 /agent tmux [handoff-id|agent-id|latest|parent]
@@ -83,6 +83,12 @@ The dashboard currently shows up to 20 persisted handoffs. `.pi/handoffs.json` s
 ### `/agent ask`
 
 Starts a background subagent and stores its result in the persisted child session. It does **not** inject the result into the master conversation.
+
+`/agent new`, `/agent ask`, and `/agent draft` accept a one-off model override:
+
+```text
+/agent ask code-explorer --model openai-codex/gpt-5.4-mini:low explore ftgo-order-service
+```
 
 ### `/agent draft`
 
